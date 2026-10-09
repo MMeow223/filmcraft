@@ -1,0 +1,19 @@
+{
+  "name": "filmcraft",
+  "version": "0.4.0",
+  "description": "Edit video with Claude: import media, cut, trim, title, add effects and transitions, look at frames, export and save, through FilmCraft's MCP server.",
+  "author": {
+    "name": "FilmCraft contributors",
+    "url": "https://github.com/storytold/filmcraft"
+  },
+  "homepage": "https://github.com/storytold/filmcraft/blob/main/docs/agents.md",
+  "repository": "https://github.com/storytold/filmcraft",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "video",
+    "video-editing",
+    "mcp",
+    "nle",
+    "export"
+  ]
+}

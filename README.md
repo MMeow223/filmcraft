@@ -234,6 +234,8 @@ Every menu item, button, slider and drag in FilmCraft is a **command** with an i
 
 The trailer and the grades in these screenshots were built exactly this way, by an agent driving the running app.
 
+**Edit with Claude.** In Claude Code, `claude plugin marketplace add storytold/filmcraft` then `claude plugin install filmcraft@filmcraft` adds the MCP server and an editing skill. Ask for an edit in plain words ("cut this down to the best 20 seconds, add a title and export an MP4"); Claude imports, cuts, looks at a contact sheet, exports and saves the project through typed tools with times in seconds. See [docs/agents.md](docs/agents.md) and [the plugin README](packaging/claude-plugin/README.md).
+
 <br>
 
 ## Everywhere

@@ -14,8 +14,22 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-**Claude Code.** The repository's `.mcp.json` registers both servers (`filmcraft` = bridge,
-`filmcraft-headless` = demo). Both point at `target/release/filmcraft-cli`, so build it first:
+**Claude Code plugin.** Outside this repository, install the plugin in
+[`packaging/claude-plugin`](../packaging/claude-plugin/README.md): the `filmcraft` (headless) and
+`filmcraft-live` (bridge) servers plus an `edit-video` skill that tells Claude how to edit with them.
+
+```sh
+claude plugin marketplace add storytold/filmcraft
+claude plugin install filmcraft@filmcraft
+```
+
+Both servers start `packaging/claude-plugin/bin/filmcraft-mcp` (`.cmd` on Windows). It runs
+`filmcraft-cli mcp` from `$FILMCRAFT_CLI`, from `PATH`, or from `target/release` in a FilmCraft
+checkout, building it with cargo there if needed.
+
+**Claude Code in this repository.** The repository's `.mcp.json` registers the same launcher as
+`filmcraft` (bridge) and `filmcraft-headless` (demo project). On a fresh clone the first start builds
+`filmcraft-cli`, which takes longer than Claude Code waits for a server, so build it first:
 
 ```sh
 cargo build --release -p filmcraft-cli -p filmcraft
@@ -35,6 +49,34 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 
 ### Tools
 
+**Editing tools** take typed arguments with times in seconds, so an agent can edit without learning
+each command's `params`. They work in both modes; every tool that edits returns `{result, timeline}`,
+where `timeline` is what `timeline_summary` returns.
+
+| Tool | Engine command | Purpose |
+|---|---|---|
+| `media_import` | `file.import` | import files by absolute path (`paths`, or `text` with one per line; `image_sequence`) → item ids |
+| `timeline_summary` | `sequence.inspect` | the active sequence in seconds: tracks `V1`… `A1`… with clips (clip and item ids, name, start/end, sourceIn/sourceOut, effects), transitions, markers |
+| `sequence_new` | `file.newSequence` | a new active sequence; `from_item` fits it to a clip and puts the clip on it |
+| `clip_place` | `timeline.place` | put an item on the timeline, by default at the end (assembles in order); `source_in_seconds`, `duration_seconds`, `track`, `insert` |
+| `clip_split` | `timeline.razor` | cut clips at `at_seconds` (all tracks, one `track`, or one `clip`); an error if nothing was cut |
+| `clip_trim` | `timeline.trim` | move a clip's `in`/`out` edge by `delta_seconds` or `delta_frames`; `ripple` |
+| `clip_move` | `timeline.move` | move a clip to `to_seconds`, optionally onto another `track` |
+| `clip_delete` | `edit.rippleDelete` / `edit.clear` | remove clips, closing the gap unless `ripple: false` |
+| `effect_list` | `effects.list` | effects and transitions (`kind`, `filter`) |
+| `effect_apply` | `effects.apply` | apply an effect to clips |
+| `transition_add` | `sequence.applyVideoTransition` / `applyAudioTransition` | a transition on a clip's edge (`frames`, `effect`, `audio`) |
+| `title_add` | `graphics.newText` | a text title as a new graphic clip (`at_seconds`, `duration_seconds`, `size`, `position`, `font`) |
+| `export_video` | `file.exportMedia` | render to `path` and wait (progress and cancellation as below); the format follows the extension; `preset`, `start_seconds`/`end_seconds`, `width`/`height`, `loudness_lufs` |
+| `project_save` | `file.save` / `file.saveAs` | save the project; nothing is saved automatically |
+| `edit_undo` / `edit_redo` | `edit.undo` / `edit.redo` | undo or redo the last edit |
+| `render_contact_sheet` | (renders) | one PNG of up to 16 evenly spaced frames of the sequence, with their times (headless) |
+
+Arguments are checked before anything runs: a time that is not finite, negative or longer than a
+day, a `count` outside 1–16 and the like are error results naming the argument.
+
+**Core and inspection tools:**
+
 | Tool | Modes | Purpose |
 |---|---|---|
 | `command_list` | both | every command: id, label, menu, shortcut, params, enabled now (`filter`, `enabled_only`) |
@@ -44,7 +86,6 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 | `render_preview` | both | same as `render_frame` |
 | `project_inspect` | both | bins and items with ids, types, durations; active sequence |
 | `sequence_inspect` | both | the active sequence: tracks, clips (`start` / `end` and `sourceIn` / `sourceOut` in ticks, frames, `speed`, `reverse`: the clip plays its `sourceIn` to `sourceOut` stretch backward, `gainDb`), effects, transitions, markers (name and `comment`), playhead, selection |
-| `media_import` | both | import files by absolute path (`text`, one path per line) |
 | `render_frame` | both | PNG of the program frame at `seconds` (headless renders; bridge screenshots the Program monitor). Read-only: the playhead and selection are left as they were |
 | `ui_inspect` | bridge | UI state: tool, workspace, panels, zoom, playback, fps |
 | `ui_elements` | bridge | on-screen interactive elements with id, label and rect (`prefix` filter) |
@@ -55,8 +96,10 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 | `ui_screenshot` | bridge | PNG of the window or one `panel` |
 | `ui_control` | bridge | call any control-channel method directly (`ui.set`, `ui.scroll`, `ui.timeline.locate`, …) |
 
-Typical loop: `project_inspect` / `sequence_inspect` → get ids → `command_run` → `render_frame` or
-`ui_screenshot` → look at the result → `edit.undo` if it's wrong.
+Typical loop: `media_import` → `sequence_new {from_item}` → `clip_place` / `clip_split` /
+`clip_trim` / `clip_delete` → `render_contact_sheet` → `export_video` → `project_save`. For anything
+the editing tools don't cover: `command_list {filter}` → `command_run` → `render_frame` or
+`ui_screenshot` → look at the result → `edit_undo` if it's wrong.
 
 ### Conventions
 
@@ -83,9 +126,9 @@ driven one app can drive the others.
 
 ### Long exports: progress and cancellation
 
-`command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
-the file is written. It uses the MCP progress and cancellation utilities, so a client can show
-progress and stop it:
+`export_video`, `command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` and such a
+step in `command_batch` block until the file is written. They use the MCP progress and cancellation
+utilities, so a client can show progress and stop it:
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.

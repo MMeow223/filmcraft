@@ -7,7 +7,8 @@ use filmcraft_engine::Session;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock as Content};
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,7 +26,7 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// A failed blocking task: a panic is reported as an internal error and the session stays usable.
-fn join_error(e: tokio::task::JoinError) -> AutomationError {
+pub(crate) fn join_error(e: tokio::task::JoinError) -> AutomationError {
     match e.try_into_panic() {
         Ok(p) => AutomationError::Other(format!("internal error: {}", panic_message(p))),
         Err(e) => AutomationError::Other(e.to_string()),
@@ -34,7 +35,7 @@ fn join_error(e: tokio::task::JoinError) -> AutomationError {
 
 #[derive(Clone)]
 pub struct FilmcraftMcp {
-    backend: Arc<Backend>,
+    pub(crate) backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -140,6 +141,19 @@ pub struct TypeParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ImportParams {
+    /// Absolute paths of the files to import.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// Or the paths as text, one per line.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Import a numbered still (`shot_0001.png`) and the rest of its run as one image sequence.
+    #[serde(default)]
+    pub image_sequence: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ElementsParams {
     /// Only element ids starting with this prefix (e.g. `timeline.clip.`).
     #[serde(default)]
@@ -154,16 +168,16 @@ pub struct ControlParams {
     pub params: Option<Value>,
 }
 
-fn ok_json(v: &Value) -> CallToolResult {
+pub(crate) fn ok_json(v: &Value) -> CallToolResult {
     CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(v).unwrap_or_default())])
 }
-fn fail(e: impl std::fmt::Display) -> CallToolResult {
+pub(crate) fn fail(e: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![Content::text(e.to_string())])
 }
-fn png_result(png: &[u8], note: &str) -> CallToolResult {
+pub(crate) fn png_result(png: &[u8], note: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"), Content::text(note.to_string())])
 }
-fn wrap(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpError> {
+pub(crate) fn wrap(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpError> {
     Ok(match r {
         Ok(v) => ok_json(&v),
         Err(e) => fail(e),
@@ -172,10 +186,10 @@ fn wrap(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpError> {
 
 impl FilmcraftMcp {
     pub fn headless(session: Session) -> Self {
-        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() }
+        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() + Self::edit_router() }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() })
+        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() + Self::edit_router() })
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
@@ -318,11 +332,21 @@ impl FilmcraftMcp {
         description = "Run several commands in order: {steps: [{id, params?}], stop_on_error?: true}. Returns {completed, failed, results: [{ok, result | error}]}; each edit is its own undo step.",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn command_batch(&self, Parameters(p): Parameters<BatchParams>) -> Result<CallToolResult, McpError> {
+    async fn command_batch(&self, Parameters(p): Parameters<BatchParams>, context: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
         for st in p.steps {
-            match self.run(&st.id, st.params.unwrap_or(json!({}))).await {
+            let params = st.params.unwrap_or(json!({}));
+            // a blocking export reports progress and can be cancelled here too
+            let r = if crate::long_job::is_long(&st.id, &params) {
+                let r = self.run_long(&st.id, params, &context).await;
+                let text = r.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n");
+                if r.is_error == Some(true) { Err(AutomationError::Other(text)) } else { Ok(serde_json::from_str(&text).unwrap_or(Value::String(text))) }
+            } else {
+                self.run(&st.id, params).await
+            };
+            let cancelled = context.ct.is_cancelled();
+            match r {
                 Ok(v) => {
                     completed += 1;
                     results.push(json!({"ok": true, "result": v}));
@@ -334,6 +358,10 @@ impl FilmcraftMcp {
                         break;
                     }
                 }
+            }
+            // a cancelled request runs no further steps
+            if cancelled {
+                break;
             }
         }
         let v = json!({"completed": completed, "failed": failed, "results": results});
@@ -378,12 +406,20 @@ impl FilmcraftMcp {
 
     #[tool(
         title = "Import media",
-        description = "Import media files by absolute path (MP4/MOV, WAV/MP3/FLAC/AIFF/Ogg, PNG/JPEG/…).",
+        description = "Import media files by absolute path (MP4/MOV/MXF, WAV/MP3/FLAC/AIFF/Ogg, PNG/JPEG/…) into the project. Returns the new project item ids (`items`) to use with sequence_new and clip_place, and any per-file `errors`.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn media_import(&self, Parameters(p): Parameters<TypeParams>) -> Result<CallToolResult, McpError> {
-        let paths: Vec<&str> = p.text.split('\n').map(str::trim).filter(|s| !s.is_empty()).collect();
-        wrap(self.run("file.import", json!({"paths": paths})).await)
+    pub(crate) async fn media_import(&self, Parameters(p): Parameters<ImportParams>) -> Result<CallToolResult, McpError> {
+        let mut paths: Vec<String> = p.paths.unwrap_or_default();
+        paths.extend(p.text.unwrap_or_default().split('\n').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+        if paths.is_empty() {
+            return Ok(fail("give `paths` (absolute file paths)"));
+        }
+        let mut v = json!({"paths": paths});
+        if p.image_sequence == Some(true) {
+            v["imageSequence"] = json!(true);
+        }
+        wrap(self.run("file.import", v).await)
     }
 
     #[tool(
@@ -561,7 +597,7 @@ impl FilmcraftMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). Every edit is an engine command: `command_list` to discover ids/params, `command_run` to execute (undoable; `command_batch` runs several). `doc_inspect` (or `project_inspect`/`sequence_inspect`) returns ids you can pass to commands; `render_preview` shows the result. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it. Time is in ticks: 254016000000 per second (commands also accept `seconds`, `frame` or `timecode`).";
+const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). To edit: `media_import {paths}` → `sequence_new {from_item}` (a sequence that fits the clip, with the clip on it) → `clip_place` (appends at the end by default) → `clip_split` / `clip_trim` / `clip_move` / `clip_delete` → `title_add`, `effect_apply`, `transition_add` → check with `render_contact_sheet` or `render_frame` → `export_video {path}` → `project_save {path}`. Times are in seconds; `timeline_summary` gives clip ids, items and times (`doc_inspect` the whole project), and every edit tool returns the timeline after it. `edit_undo` reverts a mistake. Nothing is saved automatically. Anything else is an engine command (about 600: colour, audio mixing, captions, markers, multicam, interchange…): `command_list {filter}` to find ids and params, `command_run` to execute (`command_batch` runs several); engine commands take ticks (254016000000 per second) or `seconds`/`frame`/`timecode`. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it.";
 
 /// Resources: the project (as `doc_inspect`) and the command catalog (as `command_list`).
 const DOCUMENT_URI: &str = "filmcraft://document";
@@ -744,6 +780,106 @@ mod tests {
         }
         let ro = |n: &str| tools.iter().find(|t| t["name"] == n).map(|t| t["annotations"]["readOnlyHint"].clone());
         assert_eq!((ro("command_list"), ro("command_run")), (Some(json!(true)), Some(json!(false))));
+        // the typed editing tools publish real schemas: required fields and enums, not free-form params
+        let schema = |n: &str| tools.iter().find(|t| t["name"] == n).map(|t| t["inputSchema"].clone()).unwrap_or_else(|| panic!("{n} not listed"));
+        for (tool, required) in [("clip_place", "item"), ("clip_split", "at_seconds"), ("clip_trim", "edge"), ("export_video", "path"), ("title_add", "text")] {
+            let s = schema(tool);
+            assert!(s["required"].as_array().is_some_and(|r| r.contains(&json!(required))), "{tool}: {s}");
+        }
+        assert!(schema("clip_trim").to_string().contains("\"in\"") && schema("media_import")["properties"]["paths"].is_object());
+        for read_only in ["timeline_summary", "effect_list", "render_contact_sheet"] {
+            assert_eq!(ro(read_only), Some(json!(true)), "{read_only}");
+        }
+        assert!(init["result"]["instructions"].as_str().unwrap().contains("export_video"), "{init}");
+    }
+
+    /// The Claude Code plugin and the repository's `.mcp.json` start this server through the
+    /// launcher in `packaging/claude-plugin/bin`, with arguments `filmcraft-cli mcp` takes.
+    #[test]
+    fn mcp_configs_start_the_launcher() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plugin = root.join("packaging/claude-plugin");
+        for (config, base) in [(plugin.join(".mcp.json"), "${CLAUDE_PLUGIN_ROOT}/"), (root.join(".mcp.json"), "packaging/claude-plugin/")] {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+            let servers = v["mcpServers"].as_object().unwrap();
+            assert_eq!(servers.len(), 2, "{v}");
+            for (name, s) in servers {
+                let cmd = s["command"].as_str().unwrap();
+                assert_eq!(cmd.strip_prefix(base), Some("bin/filmcraft-mcp"), "{}: {name}", config.display());
+                let args: Vec<&str> = s["args"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+                assert!(matches!(args.as_slice(), [] | ["--demo"] | ["--bridge", "127.0.0.1:9876"]), "{name}: {args:?}");
+            }
+        }
+        for launcher in ["bin/filmcraft-mcp", "bin/filmcraft-mcp.cmd", "skills/edit-video/SKILL.md", ".claude-plugin/plugin.json"] {
+            assert!(plugin.join(launcher).is_file(), "{launcher}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(plugin.join("bin/filmcraft-mcp")).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "the launcher is executable");
+        }
+        // a release bump (Cargo.toml) bumps the plugin too, so Claude Code offers the update
+        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"), "packaging/claude-plugin/.claude-plugin/plugin.json version");
+        // the skill names tools that exist
+        let skill = std::fs::read_to_string(plugin.join("skills/edit-video/SKILL.md")).unwrap();
+        let tools = FilmcraftMcp::headless(Session::default()).tool_router.list_all();
+        for t in [
+            "media_import",
+            "sequence_new",
+            "clip_place",
+            "clip_split",
+            "clip_trim",
+            "clip_delete",
+            "title_add",
+            "render_contact_sheet",
+            "export_video",
+            "project_save",
+        ] {
+            assert!(skill.contains(t) && tools.iter().any(|x| x.name == t), "{t}");
+        }
+    }
+
+    /// `export_video` waits for the file and reports progress, like `command_run file.exportMedia`
+    /// with `wait`; so does a blocking export inside `command_batch`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_video_waits_and_reports_progress() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-export-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Client::start(demo());
+        c.init().await;
+        let out = dir.join("cut.mp4").to_string_lossy().to_string();
+        let args = json!({"path": out, "width": 320, "height": 180, "audio": false, "start_seconds": 0, "end_seconds": 1.0});
+        c.send(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"export_video","arguments":args,"_meta":{"progressToken":"t"}}}).to_string(),
+        )
+        .await;
+        let mut notes = 0;
+        let done = loop {
+            let m = c.next().await;
+            if m["method"] == "notifications/progress" {
+                notes += 1;
+            } else if m["id"] == 1 {
+                break m;
+            }
+        };
+        assert_eq!(done["result"]["isError"], false, "{done}");
+        assert!(notes >= 1 && std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) > 0, "{notes} notifications; {done}");
+        // an unknown extension says what to give instead
+        let r = c.call(2, "export_video", json!({"path": dir.join("x.xyz").to_string_lossy()})).await;
+        assert!(r["result"]["isError"] == true && r["result"]["content"][0]["text"].as_str().unwrap().contains("format"), "{r}");
+        // a batched blocking export runs as a job too and returns its result
+        let out2 = dir.join("batch.mp4").to_string_lossy().to_string();
+        let params = json!({"path": out2, "format": "h264", "width": 320, "height": 180, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 0.5, "wait": true});
+        let r = c
+            .call(3, "command_batch", json!({"steps": [{"id": "file.exportMedia", "params": params}, {"id": "playhead.set", "params": {"seconds": 0.5}}]}))
+            .await;
+        let v: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!((v["completed"].as_u64(), v["failed"].as_u64()), (Some(2), Some(0)), "{v}");
+        assert!(v["results"][0]["result"]["path"].is_string(), "{v}");
+        assert!(std::path::Path::new(&out2).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Strict arguments, malformed JSON, batch, doc_inspect and render_preview over the raw line

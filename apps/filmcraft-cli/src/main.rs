@@ -8,7 +8,7 @@ mod args;
 mod probe;
 
 use args::{Args, parse_value};
-use filmcraft_automation::BridgeClient;
+use filmcraft_automation::{BridgeClient, format_for};
 use filmcraft_engine::Session;
 use serde_json::{Value, json};
 
@@ -135,23 +135,6 @@ impl Backend {
 fn print(a: &Args, v: &Value) {
     let s = if a.flag("--compact") { serde_json::to_string(v) } else { serde_json::to_string_pretty(v) };
     println!("{}", s.unwrap_or_default());
-}
-
-/// Export format from the output file's extension.
-fn format_for(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "mp4" | "m4v" => "h264",
-        "mov" => "prores",
-        "mxf" => "mxf-op1a",
-        "png" => "png",
-        "gif" => "gif",
-        "wav" => "wav",
-        "tif" | "tiff" => "tiff",
-        "bmp" => "bmp",
-        "aif" | "aiff" => "aiff",
-        _ => return None,
-    })
 }
 
 /// OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows) in front of our

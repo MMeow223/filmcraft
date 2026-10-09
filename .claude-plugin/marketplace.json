@@ -1,0 +1,14 @@
+{
+  "name": "filmcraft",
+  "owner": { "name": "FilmCraft contributors", "url": "https://github.com/storytold/filmcraft" },
+  "metadata": { "description": "FilmCraft, the open-source pure-Rust video editor, for Claude Code." },
+  "plugins": [
+    {
+      "name": "filmcraft",
+      "source": "./packaging/claude-plugin",
+      "description": "Edit video with Claude: import media, cut, trim, title, add effects and transitions, look at frames, export and save, through FilmCraft's MCP server.",
+      "category": "media",
+      "keywords": ["video", "video-editing", "mcp", "nle", "export"]
+    }
+  ]
+}

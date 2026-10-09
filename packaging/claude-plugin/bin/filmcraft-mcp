@@ -1,0 +1,79 @@
+#!/bin/sh
+# Start FilmCraft's MCP server on stdio: `filmcraft-cli mcp [args]`.
+#
+# Finds filmcraft-cli, in order:
+#   1. $FILMCRAFT_CLI
+#   2. filmcraft-cli on PATH (the release packages install it)
+#   3. target/release/filmcraft-cli in a FilmCraft checkout: the one this script is in, or
+#      $FILMCRAFT_REPO, or the current directory or one above it
+#   4. in such a checkout with cargo: `cargo build --release -p filmcraft-cli` first (a few minutes
+#      the first time; if the MCP client gives up waiting, reconnect once it has finished)
+#
+# Only stdout carries MCP; everything this script says goes to stderr.
+
+set -u
+
+say() { printf 'filmcraft-mcp: %s\n' "$*" >&2; }
+
+# A FilmCraft checkout at or above $1, if any.
+checkout_above() {
+	d=$1
+	while [ -n "$d" ] && [ "$d" != "/" ]; do
+		if [ -f "$d/Cargo.toml" ] && [ -d "$d/apps/filmcraft-cli" ]; then
+			printf '%s\n' "$d"
+			return 0
+		fi
+		d=$(dirname "$d")
+	done
+	return 1
+}
+
+if [ -n "${FILMCRAFT_CLI:-}" ]; then
+	if [ -x "$FILMCRAFT_CLI" ]; then
+		say "using $FILMCRAFT_CLI"
+		exec "$FILMCRAFT_CLI" mcp "$@"
+	fi
+	say "FILMCRAFT_CLI=$FILMCRAFT_CLI is not an executable file"
+	exit 1
+fi
+
+if command -v filmcraft-cli >/dev/null 2>&1; then
+	say "using $(command -v filmcraft-cli)"
+	exec filmcraft-cli mcp "$@"
+fi
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo=""
+for start in "$here" "${FILMCRAFT_REPO:-}" "$PWD"; do
+	[ -n "$start" ] || continue
+	if repo=$(checkout_above "$start"); then
+		break
+	fi
+	repo=""
+done
+
+if [ -n "$repo" ]; then
+	# Cargo's target dir, unless the environment moves it
+	target=${CARGO_TARGET_DIR:-$repo/target}
+	case $target in
+	/*) ;;
+	*) target=$repo/$target ;;
+	esac
+	cli=$target/release/filmcraft-cli
+	if [ ! -x "$cli" ]; then
+		if ! command -v cargo >/dev/null 2>&1; then
+			say "no filmcraft-cli: install cargo (https://rustup.rs) or a FilmCraft release, or set FILMCRAFT_CLI"
+			exit 1
+		fi
+		say "building filmcraft-cli in $repo (first run only; this takes a few minutes)"
+		(cd "$repo" && cargo build --release -p filmcraft-cli) >&2 || {
+			say "cargo build failed"
+			exit 1
+		}
+	fi
+	say "using $cli"
+	exec "$cli" mcp "$@"
+fi
+
+say "filmcraft-cli not found: install a FilmCraft release (https://github.com/storytold/filmcraft#downloads), set FILMCRAFT_CLI to the binary, or set FILMCRAFT_REPO to a FilmCraft checkout"
+exit 1

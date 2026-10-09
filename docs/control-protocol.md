@@ -139,10 +139,14 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 
 ## MCP
 `filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
-or `--bridge 127.0.0.1:9876` to drive the running app. Tools: `command_list`, `command_run`,
-`command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`, `media_import`,
+or `--bridge 127.0.0.1:9876` to drive the running app. Typed editing tools with times in seconds:
+`media_import`, `timeline_summary`, `sequence_new`, `clip_place`, `clip_split`, `clip_trim`, `clip_move`,
+`clip_delete`, `effect_list`, `effect_apply`, `transition_add`, `title_add`, `export_video`,
+`project_save`, `edit_undo`, `edit_redo`, `render_contact_sheet`. Other tools: `command_list`, `command_run`,
+`command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`,
 `render_frame`, `ui_inspect`, `ui_elements`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_screenshot`,
-`ui_control`; resources `filmcraft://document` and `filmcraft://commands`. `.mcp.json` registers both.
+`ui_control`; resources `filmcraft://document` and `filmcraft://commands`. `.mcp.json` registers both, and the
+Claude Code plugin in `packaging/claude-plugin` does the same outside the repository.
 Annotations, argument checking, errors and export progress / cancellation:
 [agents.md § Conventions](agents.md#conventions).
 

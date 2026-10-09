@@ -1,12 +1,12 @@
 {
   "mcpServers": {
     "filmcraft": {
-      "command": "target/release/filmcraft-cli",
-      "args": ["mcp", "--bridge", "127.0.0.1:9876"]
+      "command": "packaging/claude-plugin/bin/filmcraft-mcp",
+      "args": ["--bridge", "127.0.0.1:9876"]
     },
     "filmcraft-headless": {
-      "command": "target/release/filmcraft-cli",
-      "args": ["mcp", "--demo"]
+      "command": "packaging/claude-plugin/bin/filmcraft-mcp",
+      "args": ["--demo"]
     }
   }
 }

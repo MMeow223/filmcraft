@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "filmcraft": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/filmcraft-mcp",
+      "args": []
+    },
+    "filmcraft-live": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/filmcraft-mcp",
+      "args": ["--bridge", "127.0.0.1:9876"]
+    }
+  }
+}
